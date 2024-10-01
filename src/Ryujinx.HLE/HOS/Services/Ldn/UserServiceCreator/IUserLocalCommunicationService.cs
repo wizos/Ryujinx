@@ -1,4 +1,4 @@
-﻿using LibHac.Ns;
+using LibHac.Ns;
 using Ryujinx.Common;
 using Ryujinx.Common.Configuration.Multiplayer;
 using Ryujinx.Common.Logging;
@@ -8,7 +8,7 @@ using Ryujinx.Cpu;
 using Ryujinx.HLE.HOS.Ipc;
 using Ryujinx.HLE.HOS.Kernel.Threading;
 using Ryujinx.HLE.HOS.Services.Ldn.Types;
-using Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator.RyuLdn;
+using Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator.LdnMitm;
 using Ryujinx.Horizon.Common;
 using Ryujinx.Memory;
 using System;
@@ -29,6 +29,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
         private const bool IsDevelopment = false;
 
         private readonly KEvent _stateChangeEvent;
+        private int _stateChangeEventHandle;
 
         private NetworkState _state;
         private DisconnectReason _disconnectReason;
@@ -277,12 +278,12 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
         // AttachStateChangeEvent() -> handle<copy>
         public ResultCode AttachStateChangeEvent(ServiceCtx context)
         {
-            if (context.Process.HandleTable.GenerateHandle(_stateChangeEvent.ReadableEvent, out int stateChangeEventHandle) != Result.Success)
+            if (_stateChangeEventHandle == 0 && context.Process.HandleTable.GenerateHandle(_stateChangeEvent.ReadableEvent, out _stateChangeEventHandle) != Result.Success)
             {
                 throw new InvalidOperationException("Out of handles!");
             }
 
-            context.Response.HandleDesc = IpcHandleDesc.MakeCopy(stateChangeEventHandle);
+            context.Response.HandleDesc = IpcHandleDesc.MakeCopy(_stateChangeEventHandle);
 
             // Returns ResultCode.InvalidArgument if handle is null, doesn't occur in our case since we already throw an Exception.
 
@@ -394,7 +395,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
                             }
                             else
                             {
-                                if (scanFilter.NetworkId.IntentId.LocalCommunicationId == -1)
+                                if (scanFilter.NetworkId.IntentId.LocalCommunicationId == -1 && NetworkClient.NeedsRealId)
                                 {
                                     // TODO: Call nn::arp::GetApplicationControlProperty here when implemented.
                                     ApplicationControlProperty controlProperty = context.Device.Processes.ActiveApplication.ApplicationControlProperties;
@@ -545,7 +546,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
             context.RequestData.BaseStream.Seek(4, SeekOrigin.Current); // Alignment?
             NetworkConfig networkConfig = context.RequestData.ReadStruct<NetworkConfig>();
 
-            if (networkConfig.IntentId.LocalCommunicationId == -1)
+            if (networkConfig.IntentId.LocalCommunicationId == -1 && NetworkClient.NeedsRealId)
             {
                 // TODO: Call nn::arp::GetApplicationControlProperty here when implemented.
                 ApplicationControlProperty controlProperty = context.Device.Processes.ActiveApplication.ApplicationControlProperties;
@@ -554,7 +555,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
             }
 
             bool isLocalCommunicationIdValid = CheckLocalCommunicationIdPermission(context, (ulong)networkConfig.IntentId.LocalCommunicationId);
-            if (!isLocalCommunicationIdValid)
+            if (!isLocalCommunicationIdValid && NetworkClient.NeedsRealId)
             {
                 return ResultCode.InvalidObject;
             }
@@ -567,13 +568,13 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
             networkConfig.Channel = CheckDevelopmentChannel(networkConfig.Channel);
             securityConfig.SecurityMode = CheckDevelopmentSecurityMode(securityConfig.SecurityMode);
 
-            if (networkConfig.NodeCountMax <= 8)
+            if (networkConfig.NodeCountMax <= LdnConst.NodeCountMax)
             {
                 if ((((ulong)networkConfig.LocalCommunicationVersion) & 0x80000000) == 0)
                 {
                     if (securityConfig.SecurityMode <= SecurityMode.Retail)
                     {
-                        if (securityConfig.Passphrase.Length <= 0x40)
+                        if (securityConfig.Passphrase.Length <= LdnConst.PassphraseLengthMax)
                         {
                             if (_state == NetworkState.AccessPoint)
                             {
@@ -677,7 +678,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
                 return _nifmResultCode;
             }
 
-            if (bufferSize == 0 || bufferSize > 0x180)
+            if (bufferSize == 0 || bufferSize > LdnConst.AdvertiseDataSizeMax)
             {
                 return ResultCode.InvalidArgument;
             }
@@ -847,10 +848,10 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
 
                 context.Memory.Read(bufferPosition, networkInfoBytes);
 
-                networkInfo = MemoryMarshal.Cast<byte, NetworkInfo>(networkInfoBytes)[0];
+                networkInfo = MemoryMarshal.Read<NetworkInfo>(networkInfoBytes);
             }
 
-            if (networkInfo.NetworkId.IntentId.LocalCommunicationId == -1)
+            if (networkInfo.NetworkId.IntentId.LocalCommunicationId == -1 && NetworkClient.NeedsRealId)
             {
                 // TODO: Call nn::arp::GetApplicationControlProperty here when implemented.
                 ApplicationControlProperty controlProperty = context.Device.Processes.ActiveApplication.ApplicationControlProperties;
@@ -859,7 +860,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
             }
 
             bool isLocalCommunicationIdValid = CheckLocalCommunicationIdPermission(context, (ulong)networkInfo.NetworkId.IntentId.LocalCommunicationId);
-            if (!isLocalCommunicationIdValid)
+            if (!isLocalCommunicationIdValid && NetworkClient.NeedsRealId)
             {
                 return ResultCode.InvalidObject;
             }
@@ -964,6 +965,12 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
                 SetDisconnectReason(DisconnectReason.None);
             }
 
+            if (_stateChangeEventHandle != 0)
+            {
+                context.Process.HandleTable.CloseHandle(_stateChangeEventHandle);
+                _stateChangeEventHandle = 0;
+            }
+
             return resultCode;
         }
 
@@ -1021,7 +1028,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
 
             SetState(NetworkState.None);
 
-            NetworkClient?.DisconnectAndStop();
+            NetworkClient?.Dispose();
             NetworkClient = null;
 
             return ResultCode.Success;
@@ -1054,10 +1061,16 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
                     if (System.Net.NetworkInformation.NetworkInterface.GetIsNetworkAvailable())
                     {
                         MultiplayerMode mode = context.Device.Configuration.MultiplayerMode;
+
+                        Logger.Info?.PrintMsg(LogClass.ServiceLdn, $"Initializing with multiplayer mode: {mode}");
+
                         switch (mode)
                         {
+                            case MultiplayerMode.LdnMitm:
+                                NetworkClient = new LdnMitmClient(context.Device.Configuration);
+                                break;
                             case MultiplayerMode.Disabled:
-                                NetworkClient = new DisabledLdnClient();
+                                NetworkClient = new LdnDisabledClient();
                                 break;
                         }
 
@@ -1072,7 +1085,7 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
                     }
                     else
                     {
-                        // NOTE: Service returns differents ResultCode here related to the nifm ResultCode.
+                        // NOTE: Service returns different ResultCode here related to the nifm ResultCode.
                         resultCode = ResultCode.DeviceDisabled;
                         _nifmResultCode = resultCode;
                     }
@@ -1084,14 +1097,13 @@ namespace Ryujinx.HLE.HOS.Services.Ldn.UserServiceCreator
 
         public void Dispose()
         {
-            if (NetworkClient != null)
-            {
-                _station?.Dispose();
-                _accessPoint?.Dispose();
+            _station?.Dispose();
+            _station = null;
 
-                NetworkClient.DisconnectAndStop();
-            }
+            _accessPoint?.Dispose();
+            _accessPoint = null;
 
+            NetworkClient?.Dispose();
             NetworkClient = null;
         }
     }

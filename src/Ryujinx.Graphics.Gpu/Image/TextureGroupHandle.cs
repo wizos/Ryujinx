@@ -1,4 +1,4 @@
-﻿using Ryujinx.Graphics.Gpu.Synchronization;
+using Ryujinx.Graphics.Gpu.Synchronization;
 using Ryujinx.Memory.Tracking;
 using System;
 using System.Collections.Generic;
@@ -121,7 +121,7 @@ namespace Ryujinx.Graphics.Gpu.Image
         public TextureGroupHandle(TextureGroup group,
                                   int offset,
                                   ulong size,
-                                  List<Texture> views,
+                                  IEnumerable<Texture> views,
                                   int firstLayer,
                                   int firstLevel,
                                   int baseSlice,
@@ -152,15 +152,40 @@ namespace Ryujinx.Graphics.Gpu.Image
                 // Linear textures are presumed to be used for readback initially.
                 _flushBalance = FlushBalanceThreshold + FlushBalanceIncrement;
             }
+
+            foreach (RegionHandle handle in handles)
+            {
+                handle.RegisterDirtyEvent(DirtyAction);
+            }
+        }
+
+        /// <summary>
+        /// The action to perform when a memory tracking handle is flipped to dirty.
+        /// This notifies overlapping textures that the memory needs to be synchronized.
+        /// </summary>
+        private void DirtyAction()
+        {
+            // Notify all textures that belong to this handle.
+
+            _group.Storage.SignalGroupDirty();
+
+            lock (Overlaps)
+            {
+                foreach (Texture overlap in Overlaps)
+                {
+                    overlap.SignalGroupDirty();
+                }
+            }
+
+            DeferredCopy = null;
         }
 
         /// <summary>
         /// Discards all data for this handle.
-        /// This clears all dirty flags, modified flags, and pending copies from other handles.
+        /// This clears all dirty flags and pending copies from other handles.
         /// </summary>
         public void DiscardData()
         {
-            Modified = false;
             DeferredCopy = null;
 
             foreach (RegionHandle handle in Handles)
@@ -176,8 +201,8 @@ namespace Ryujinx.Graphics.Gpu.Image
         /// Calculate a list of which views overlap this handle.
         /// </summary>
         /// <param name="group">The parent texture group, used to find a view's base CPU VA offset</param>
-        /// <param name="views">The list of views to search for overlaps</param>
-        public void RecalculateOverlaps(TextureGroup group, List<Texture> views)
+        /// <param name="views">The views to search for overlaps</param>
+        public void RecalculateOverlaps(TextureGroup group, IEnumerable<Texture> views)
         {
             // Overlaps can be accessed from the memory tracking signal handler, so access must be atomic.
             lock (Overlaps)
@@ -449,7 +474,6 @@ namespace Ryujinx.Graphics.Gpu.Image
         public void DeferCopy(TextureGroupHandle copyFrom)
         {
             Modified = false;
-
             DeferredCopy = copyFrom;
 
             _group.Storage.SignalGroupDirty();
@@ -506,7 +530,7 @@ namespace Ryujinx.Graphics.Gpu.Image
                 {
                     existing.Other.Handle.CreateCopyDependency(this);
 
-                    if (copyToOther)
+                    if (copyToOther && Modified)
                     {
                         existing.Other.Handle.DeferCopy(this);
                     }
@@ -550,10 +574,10 @@ namespace Ryujinx.Graphics.Gpu.Image
                 if (fromHandle != null)
                 {
                     // Only copy if the copy texture is still modified.
-                    // It will be set as unmodified if new data is written from CPU, as the data previously in the texture will flush.
+                    // DeferredCopy will be set to null if new data is written from CPU (see the DirtyAction method).
                     // It will also set as unmodified if a copy is deferred to it.
 
-                    shouldCopy = fromHandle.Modified;
+                    shouldCopy = true;
 
                     if (fromHandle._bindCount == 0)
                     {
